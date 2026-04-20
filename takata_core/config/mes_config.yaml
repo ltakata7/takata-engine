@@ -1,0 +1,119 @@
+# MES (Micro E-mini S&P 500) Configuration
+
+instrument:
+  symbol: MES
+  exchange: CME
+  tick_size: 0.25          # 0.25 index points
+  tick_value: 1.25         # $1.25 per tick per contract
+  point_value: 5.0         # $5 per point per contract (1 pt = 4 ticks)
+  contract_multiplier: 5   # $5 x S&P 500 Index
+  currency: USD
+  # 1/10th of ES | Quarterly expiry (Mar/Jun/Sep/Dec)
+  # Cash-settled | Trading: Sun 5pm - Fri 4pm CT (break 4-5pm CT)
+  # Typical day range: 30-80 pts | 10pt move = $50/contract
+
+sessions:
+  rth:
+    name: Regular Trading Hours
+    open: "09:30"
+    close: "16:00"
+    timezone: America/New_York
+  eth:
+    name: Extended Trading Hours
+    open: "18:00"
+    close: "17:00"       # next day
+    timezone: America/New_York
+
+bar:
+  default_timeframe: 5min
+  timeframes: [1min, 5min, 15min]
+
+indicators:
+  ema:
+    fast: 9
+    slow: 21
+  macd:
+    fast: 12
+    slow: 26
+    signal: 9
+  rsi:
+    period: 14
+    overbought: 70
+    oversold: 30
+  bollinger:
+    period: 20
+    std_dev: 2.0
+  adx:
+    period: 14
+    trend_threshold: 25
+  atr:
+    period: 14
+  vwap:
+    std_bands: [1.0, 2.0]
+
+risk:
+  max_position_size: 1.0    # fraction of max allowed
+  stop_atr_mult: 2.0
+  target_atr_mult: 3.0
+  max_daily_loss: 500       # USD
+
+multi_timeframe:
+  bias_timeframes: ["daily", "60m"]
+  confirmation_timeframe: "15m"
+  entry_timeframe: "5m"
+  scalp_timeframe: "3m"
+  full_fetch_interval: 300    # 5 minutes
+  fast_update_interval: 5     # 5 seconds
+  levels_from: ["daily", "60m"]
+
+filters:
+  session_only: true
+  first_n_minutes_skip: 15     # skip first 15 min after open
+  last_n_minutes_skip: 15      # skip last 15 min before close
+
+regime:
+  window_size: 30            # bars per window (distribution)
+  stride: 5                  # bars between windows
+  k: 3                       # number of regimes
+  max_iter: 50
+  gamma: 1.0
+  retrain_interval: 500      # bars between re-fits
+
+# MES regime profiles — US equity index future
+# Characteristics: high liquidity, follows S&P 500, sensitive to Fed/macro,
+# mean-reverting intraday, trends on daily timeframe
+regimes:
+  low_vol_trending:
+    indicators:
+      ema: { fast: 9, slow: 21 }
+      rsi: { period: 14, overbought: 70, oversold: 30 }
+      adx: { trend_threshold: 20 }
+    risk:
+      stop_atr_mult: 2.0
+      target_atr_mult: 3.0
+      max_position_size: 1.0
+    # MES trending: follow the trend, wider stops
+  high_vol_choppy:
+    indicators:
+      ema: { fast: 5, slow: 13 }
+      rsi: { period: 7, overbought: 75, oversold: 25 }
+      adx: { trend_threshold: 30 }
+    risk:
+      stop_atr_mult: 1.0
+      target_atr_mult: 1.5
+      max_position_size: 0.5
+    # MES choppy: quick scalps only, tighter stops, higher ADX threshold
+  crisis:
+    indicators:
+      ema: { fast: 5, slow: 13 }
+      rsi: { period: 7, overbought: 85, oversold: 15 }
+      adx: { trend_threshold: 40 }
+    risk:
+      stop_atr_mult: 0.5
+      target_atr_mult: 1.0
+      max_position_size: 0.0
+    # MES crisis: NO TRADING — sit out, capital preservation
+
+logging:
+  trade_log: logs/mes_trades.jsonl
+  signal_log: logs/mes_signals.jsonl

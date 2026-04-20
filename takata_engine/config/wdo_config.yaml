@@ -1,0 +1,130 @@
+# WDO (Mini Dólar Futuro - B3) Configuration
+
+instrument:
+  symbol: WDO
+  exchange: B3
+  tick_size: 0.5           # BRL 0.5 per USD 1,000
+  tick_value: 5.0          # R$5 per tick per contract
+  point_value: 10.0        # R$10 per point per contract
+  contract_size: 10000     # USD 10,000
+  currency: BRL
+  # Variation margin: (PA - PO) x 10 x n contracts
+  # PTAX fixing: last business day of month preceding expiry
+  # Typical intraday range: 30-80 pts | Scalp: 3-8 pts | Day trade: 8-20 pts
+
+sessions:
+  regular:
+    name: Regular Session
+    open: "09:00"
+    close: "17:55"
+    timezone: America/Sao_Paulo
+  after_market:
+    name: After Market
+    open: "18:25"
+    close: "18:45"
+    timezone: America/Sao_Paulo
+
+bar:
+  default_timeframe: 5min
+  timeframes: [1min, 5min, 15min]
+
+indicators:
+  ema:
+    fast: 9
+    slow: 21
+  macd:
+    fast: 12
+    slow: 26
+    signal: 9
+  rsi:
+    period: 14
+    overbought: 70
+    oversold: 30
+  bollinger:
+    period: 20
+    std_dev: 2.0
+  adx:
+    period: 14
+    trend_threshold: 25
+  atr:
+    period: 14
+  vwap:
+    std_bands: [1.0, 2.0]
+
+risk:
+  max_position_size: 1.0
+  stop_atr_mult: 2.0
+  target_atr_mult: 3.0
+  max_daily_loss: 1000      # BRL
+
+multi_timeframe:
+  bias_timeframes: ["daily", "60m"]
+  confirmation_timeframe: "15m"
+  entry_timeframe: "5m"
+  scalp_timeframe: "3m"
+  full_fetch_interval: 300
+  fast_update_interval: 5
+  levels_from: ["daily", "60m"]
+
+session_phases:
+  # PTAX consultation windows (BRT) — critical for WDO timing
+  ptax_windows:
+    - { start: "10:00", end: "10:10", name: "window_1" }
+    - { start: "11:00", end: "11:10", name: "window_2" }
+    - { start: "12:00", end: "12:10", name: "window_3" }
+    - { start: "13:00", end: "13:10", name: "window_4" }
+  # FRP0 trades 09:00-13:00 only — forward points = PTAX formation proxy
+  frp0_close: "13:00"
+
+filters:
+  session_only: true
+  first_n_minutes_skip: 15
+  last_n_minutes_skip: 15
+
+regime:
+  window_size: 30
+  stride: 5
+  k: 3
+  max_iter: 50
+  gamma: 1.0
+  retrain_interval: 500
+
+# WDO regime profiles — Brazilian FX mini future (Mini Dólar)
+# Characteristics: BCB intervention risk, carry trade sensitive, Selic rate driven,
+# fat left tails during EM stress, bimodal distributions when BCB fights market,
+# PTAX fixing at 13:00 BRT creates intraday pattern, order flow (tape reading) critical
+regimes:
+  low_vol_trending:
+    indicators:
+      ema: { fast: 9, slow: 21 }
+      rsi: { period: 14, overbought: 65, oversold: 35 }
+      adx: { trend_threshold: 20 }
+    risk:
+      stop_atr_mult: 1.5
+      target_atr_mult: 2.5
+      max_position_size: 1.0
+    # WDO carry-calm: tight range, follow trend, respect VWAP
+  high_vol_choppy:
+    indicators:
+      ema: { fast: 5, slow: 13 }
+      rsi: { period: 7, overbought: 75, oversold: 25 }
+      adx: { trend_threshold: 30 }
+    risk:
+      stop_atr_mult: 1.0
+      target_atr_mult: 1.5
+      max_position_size: 0.5
+    # WDO volatile: BCB intervention zone, quick scalps, respect order flow
+  crisis:
+    indicators:
+      ema: { fast: 5, slow: 13 }
+      rsi: { period: 7, overbought: 85, oversold: 15 }
+      adx: { trend_threshold: 40 }
+    risk:
+      stop_atr_mult: 0.5
+      target_atr_mult: 1.0
+      max_position_size: 0.0
+    # WDO crisis: EM stress, NO TRADING — BCB can move 200+ pts in seconds
+
+logging:
+  trade_log: logs/wdo_trades.jsonl
+  signal_log: logs/wdo_signals.jsonl

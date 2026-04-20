@@ -26,6 +26,9 @@ class EconomicEvent:
     blackout_before_min: int = 15  # minutes before to stop trading
     blackout_after_min: int = 10   # minutes after to resume
     reduce_size_pct: float = 0.0   # 0 = full blackout, 0.5 = half size
+    # When used in RECURRING_WEEKLY, restricts firing to the first occurrence
+    # of its weekday in the month (e.g. NFP = first Friday).
+    first_of_month_only: bool = False
 
 
 # ── Recurring weekly/monthly events (US + Brazil) ──
@@ -34,7 +37,9 @@ class EconomicEvent:
 RECURRING_WEEKLY = {
     # US events
     4: [  # Friday
-        EconomicEvent("NFP / Nonfarm Payrolls", time(12, 30), "high", ["MES", "ALL"], 30, 30),
+        # NFP: first Friday of the month only
+        EconomicEvent("NFP / Nonfarm Payrolls", time(12, 30), "high", ["MES", "ALL"], 30, 30,
+                      first_of_month_only=True),
     ],
 }
 
@@ -92,7 +97,7 @@ SCHEDULED_EVENTS: List[Tuple[str, EconomicEvent]] = [
     ("2026-04-15", EconomicEvent("Empire State Manufacturing", time(12, 30), "low", ["MES"], 5, 5)),
     ("2026-04-16", EconomicEvent("Initial Jobless Claims", time(12, 30), "low", ["MES"], 5, 5)),
     ("2026-04-16", EconomicEvent("Housing Starts", time(12, 30), "low", ["MES"], 5, 5)),
-    ("2026-04-17", EconomicEvent("Good Friday (US Markets Closed)", None, "high", ["MES", "ALL"], 0, 0)),
+    ("2026-04-03", EconomicEvent("Good Friday (US Markets Closed)", None, "high", ["MES", "ALL"], 0, 0)),
 ]
 
 # ── Ad-hoc events (added at runtime) ──
@@ -130,6 +135,9 @@ class CalendarFilter:
         # Recurring weekly events
         dow = now.weekday()
         for event in RECURRING_WEEKLY.get(dow, []):
+            # first_of_month_only gate (e.g. NFP = first Friday of month, day 1-7)
+            if event.first_of_month_only and now.day > 7:
+                continue
             if self.instrument in event.affects or "ALL" in event.affects:
                 if event.time_utc:
                     event_dt = now.replace(hour=event.time_utc.hour, minute=event.time_utc.minute, second=0)

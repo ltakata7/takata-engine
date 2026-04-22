@@ -2,19 +2,45 @@
 
 Tracks: signal details, indicator snapshot, regime, bias, session phase,
 and whether the trade would have been profitable (price hit target or stop first).
+
+Log directory resolution (checked in order):
+  1. `log_dir` kwarg passed to the constructor (wins unconditionally).
+  2. `TAKATA_ML_LOG_DIR` environment variable.
+  3. `~/.takata-engine/logs/ml` — user-home fallback. Chosen over the old
+     `site-packages-relative` default because it survives pip reinstalls
+     and doesn't require the consumer repo to layout itself relative to
+     the installed package (which broke when the library moved from an
+     in-tree monolith to a separately pip-installed dependency).
+
+Consumer apps (takata-trading etc.) should set `TAKATA_ML_LOG_DIR` to
+their project `logs/ml/` directory so signals land where the app expects
+them.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-LOG_DIR = Path(__file__).resolve().parent.parent.parent / "logs" / "ml"
+
+def _default_log_dir() -> Path:
+    """Resolve the default log directory. See module docstring for order."""
+    env = os.environ.get("TAKATA_ML_LOG_DIR")
+    if env:
+        return Path(env).expanduser().resolve()
+    return Path.home() / ".takata-engine" / "logs" / "ml"
+
+
+# Module-level aliases, kept for backwards compatibility. Any code reading
+# these at import time will see the *default* location for this process —
+# pass `log_dir=` to the constructor to override per-instance.
+LOG_DIR = _default_log_dir()
 SIGNAL_LOG = LOG_DIR / "live_signals.jsonl"
 OUTCOME_LOG = LOG_DIR / "signal_outcomes.jsonl"
 
@@ -27,10 +53,22 @@ class LiveSignalLogger:
     - Regime, bias, session phase
     - Direction, entry, stop, target, strength, reasons
     - Later: outcome (win/loss/timeout)
+
+    Parameters
+    ----------
+    log_dir : Path-like, optional
+        Override the log directory for this instance. If omitted, reads
+        `TAKATA_ML_LOG_DIR` from the environment, then falls back to
+        `~/.takata-engine/logs/ml`.
     """
 
-    def __init__(self):
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
+    def __init__(self, log_dir: Optional[Path] = None):
+        if log_dir is None:
+            log_dir = _default_log_dir()
+        self.log_dir = Path(log_dir).expanduser().resolve()
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.signal_log = self.log_dir / "live_signals.jsonl"
+        self.outcome_log = self.log_dir / "signal_outcomes.jsonl"
         self._pending: Dict[str, Dict[str, Any]] = {}  # signals awaiting outcome
 
     def log_signal(
@@ -100,7 +138,7 @@ class LiveSignalLogger:
         }
 
         # Write to log
-        with open(SIGNAL_LOG, "a") as f:
+        with open(self.signal_log, "a") as f:
             f.write(json.dumps(record, default=str) + "\n")
 
         # Track for outcome resolution
@@ -185,7 +223,7 @@ class LiveSignalLogger:
 
         # Write outcomes and remove from pending
         for record in resolved:
-            with open(OUTCOME_LOG, "a") as f:
+            with open(self.outcome_log, "a") as f:
                 f.write(json.dumps(record, default=str) + "\n")
             logger.info("ML OUTCOME: %s %s %s pnl=%.2f pts (%d bars)",
                          record["instrument"], record["direction"], record["outcome"],
@@ -198,10 +236,10 @@ class LiveSignalLogger:
 
     def get_training_data(self) -> list:
         """Load all resolved signals from the outcome log for ML training."""
-        if not OUTCOME_LOG.exists():
+        if not self.outcome_log.exists():
             return []
         records = []
-        with open(OUTCOME_LOG) as f:
+        with open(self.outcome_log) as f:
             for line in f:
                 if line.strip():
                     records.append(json.loads(line))
@@ -213,16 +251,16 @@ class LiveSignalLogger:
 
     @property
     def total_logged(self) -> int:
-        if not SIGNAL_LOG.exists():
+        if not self.signal_log.exists():
             return 0
-        with open(SIGNAL_LOG) as f:
+        with open(self.signal_log) as f:
             return sum(1 for _ in f)
 
     @property
     def total_outcomes(self) -> int:
-        if not OUTCOME_LOG.exists():
+        if not self.outcome_log.exists():
             return 0
-        with open(OUTCOME_LOG) as f:
+        with open(self.outcome_log) as f:
             return sum(1 for _ in f)
 
     def stats(self) -> Dict[str, Any]:
@@ -234,6 +272,7 @@ class LiveSignalLogger:
         total = len(outcomes)
 
         return {
+            "log_dir": str(self.log_dir),
             "total_signals_logged": self.total_logged,
             "total_outcomes": total,
             "pending": self.pending_count,

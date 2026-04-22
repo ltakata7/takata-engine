@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "takata-engine"
-version = "0.1.0"
+version = "0.1.4"
 description = "Shared analytical library: indicators, microstructure trackers, pricing, regime detection, signals, ML, macro, research, risk. Used by takata-trading, takata-wealth, and sympatheia-os."
 requires-python = ">=3.9"
 dependencies = [
@@ -45,6 +45,15 @@ all = ["takata-engine[dev,live]"]
 
 [tool.setuptools.packages.find]
 include = ["takata_engine*"]
+
+# Ship non-Python data files bundled inside the wheel. The YAML configs
+# live under takata_engine/config/ and are read at runtime by
+# takata_engine.config.loader.load_config() — without this block, setuptools
+# builds a wheel that contains loader.py but NOT mes_config.yaml /
+# wdo_config.yaml, so every consumer's load_config("MES") raises
+# FileNotFoundError on a fresh install. See v0.1.4 release notes.
+[tool.setuptools.package-data]
+takata_engine = ["config/*.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

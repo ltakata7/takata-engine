@@ -129,9 +129,21 @@ class LiveSignalLogger:
                 "leadlag_best_corr": indicators.get("leadlag_best_corr", 0),
                 "leadlag_best_lag": indicators.get("leadlag_best_lag", 0),
                 "risk_regime_score": indicators.get("risk_regime_score", 0),
+                # Statistical / multifractal features (Bloch 2016 §2.1.4–5).
+                # H ≈ 0.5 = random walk; > 0.5 trending; < 0.5 mean-rev.
+                # skew/kurt are over the trailing 30-bar return window.
+                "hurst_50": indicators.get("hurst_50", 0.5),
+                "return_skew_30": indicators.get("return_skew_30", 0.0),
+                "return_kurt_30": indicators.get("return_kurt_30", 0.0),
             },
-            # Outcome fields — filled later
-            "outcome": None,  # "win", "loss", "timeout", "breakeven"
+            # Outcome fields — filled later. mfe_pts/mae_pts are
+            # populated by check_outcomes() while the signal is
+            # pending so timeouts can be classified as
+            # timeout_favorable / timeout_adverse.
+            "outcome": None,  # "win", "loss", "timeout_favorable",
+                              # "timeout_adverse", "timeout"
+            "mfe_pts": 0.0,
+            "mae_pts": 0.0,
             "exit_price": None,
             "pnl_pts": None,
             "bars_to_exit": None,
@@ -157,6 +169,25 @@ class LiveSignalLogger:
         Call this every scan cycle with the current price.
 
         Returns list of resolved signals.
+
+        Outcome labels (one of):
+          ``win``               — target hit decisively.
+          ``loss``              — stop hit decisively.
+          ``timeout_favorable`` — neither hit in time, but maximum
+                                  favorable excursion exceeded the
+                                  maximum adverse excursion. The trade
+                                  was directionally correct without
+                                  triggering a clean R-multiple.
+          ``timeout_adverse``   — neither hit in time, MAE > MFE.
+                                  Directionally wrong; caller should
+                                  treat as a soft loss when training.
+          ``timeout``           — kept for backwards compatibility on
+                                  flat-tape signals where MFE == MAE.
+                                  Rare in practice.
+
+        The MFE/MAE split lets the ML pipeline use the ~99% of signals
+        that historically expired without a verdict — see
+        SESSION_HANDOFF for the labeling-bottleneck history.
         """
         resolved = []
         to_remove = []
@@ -177,6 +208,18 @@ class LiveSignalLogger:
             if "bars_counted" not in record:
                 record["bars_counted"] = 0
             record["bars_counted"] += 1
+
+            # Track running maximum favorable / adverse excursion in
+            # signed instrument points relative to entry, on the
+            # direction-correct side. Always non-negative.
+            if direction == "long":
+                fav_now = max(0.0, current_price - entry)
+                adv_now = max(0.0, entry - current_price)
+            else:  # short
+                fav_now = max(0.0, entry - current_price)
+                adv_now = max(0.0, current_price - entry)
+            record["mfe_pts"] = max(record.get("mfe_pts", 0.0), fav_now)
+            record["mae_pts"] = max(record.get("mae_pts", 0.0), adv_now)
 
             # Check if target hit
             if direction == "long" and current_price >= target:
@@ -212,9 +255,18 @@ class LiveSignalLogger:
                 resolved.append(record)
                 to_remove.append(sig_id)
 
-            # Timeout after 60 bars (~5 hours on 5-min bars)
+            # Timeout after 60 bars (~5 hours on 5-min bars). Classify
+            # by which excursion dominated so the ML pipeline can use
+            # these instead of dropping them as "no verdict."
             elif record["bars_counted"] > 60:
-                record["outcome"] = "timeout"
+                mfe = record.get("mfe_pts", 0.0)
+                mae = record.get("mae_pts", 0.0)
+                if mfe > mae:
+                    record["outcome"] = "timeout_favorable"
+                elif mae > mfe:
+                    record["outcome"] = "timeout_adverse"
+                else:
+                    record["outcome"] = "timeout"
                 record["exit_price"] = current_price
                 record["pnl_pts"] = (current_price - entry) if direction == "long" else (entry - current_price)
                 record["bars_to_exit"] = record["bars_counted"]
@@ -264,12 +316,41 @@ class LiveSignalLogger:
             return sum(1 for _ in f)
 
     def stats(self) -> Dict[str, Any]:
-        """Return ML logging statistics."""
+        """Return ML logging statistics.
+
+        Outcome buckets exposed:
+          ``wins``, ``losses``                 — clean R-multiple resolutions.
+          ``timeout_favorable``                — MFE > MAE at the 60-bar
+                                                 timeout (post-v0.1.6 logger).
+          ``timeout_adverse``                  — MAE > MFE at timeout.
+          ``timeouts_legacy``                  — pre-v0.1.6 timeouts and
+                                                 the rare exact-tie case.
+          ``trainable``                        — wins + losses +
+                                                 timeout_favorable +
+                                                 timeout_adverse. This is
+                                                 the dataset size the
+                                                 retrain endpoint sees.
+          ``win_rate``                         — over wins+losses only;
+                                                 the strict R-multiple rate.
+          ``directional_rate``                 — over the trainable set:
+                                                 (wins + timeout_favorable)
+                                                 / trainable. Tracks
+                                                 directional accuracy
+                                                 including soft outcomes.
+        """
         outcomes = self.get_training_data()
-        wins = sum(1 for o in outcomes if o.get("outcome") == "win")
-        losses = sum(1 for o in outcomes if o.get("outcome") == "loss")
-        timeouts = sum(1 for o in outcomes if o.get("outcome") == "timeout")
+
+        def _count(label: str) -> int:
+            return sum(1 for o in outcomes if o.get("outcome") == label)
+
+        wins = _count("win")
+        losses = _count("loss")
+        timeout_favorable = _count("timeout_favorable")
+        timeout_adverse = _count("timeout_adverse")
+        timeouts_legacy = _count("timeout")
         total = len(outcomes)
+        strict = wins + losses
+        trainable = strict + timeout_favorable + timeout_adverse
 
         return {
             "log_dir": str(self.log_dir),
@@ -278,7 +359,15 @@ class LiveSignalLogger:
             "pending": self.pending_count,
             "wins": wins,
             "losses": losses,
-            "timeouts": timeouts,
-            "win_rate": round(wins / max(total - timeouts, 1) * 100, 1),
-            "avg_bars_to_exit": round(sum(o.get("bars_to_exit", 0) for o in outcomes) / max(total, 1), 1),
+            "timeout_favorable": timeout_favorable,
+            "timeout_adverse": timeout_adverse,
+            "timeouts_legacy": timeouts_legacy,
+            "trainable": trainable,
+            "win_rate": round(wins / max(strict, 1) * 100, 1),
+            "directional_rate": round(
+                (wins + timeout_favorable) / max(trainable, 1) * 100, 1
+            ),
+            "avg_bars_to_exit": round(
+                sum(o.get("bars_to_exit", 0) for o in outcomes) / max(total, 1), 1
+            ),
         }

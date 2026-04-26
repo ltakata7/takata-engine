@@ -54,6 +54,10 @@ def signal_to_features(signal: Signal) -> Dict[str, float]:
         "leadlag_best_corr": ind.get("leadlag_best_corr", 0),
         "leadlag_best_lag": ind.get("leadlag_best_lag", 0),
         "risk_regime_score": ind.get("risk_regime_score", 0),
+        # Statistical / multifractal features (Phase D)
+        "hurst_50": ind.get("hurst_50", 0.5),
+        "return_skew_30": ind.get("return_skew_30", 0.0),
+        "return_kurt_30": ind.get("return_kurt_30", 0.0),
     }
 
 
@@ -112,4 +116,8 @@ FEATURE_COLUMNS = [
     "leadlag_best_corr",     # best leader symbol correlation
     "leadlag_best_lag",      # best leader lag in ticks
     "risk_regime_score",     # composite risk-on/off score (−100 to +100)
+    # Statistical / multifractal features (Phase D — Bloch 2016 §2.1.4–5)
+    "hurst_50",              # Hurst exp on 50 bars (>0.5 trending)
+    "return_skew_30",        # skewness of trailing 30-bar log-returns
+    "return_kurt_30",        # excess kurtosis (tail-fatness flag)
 ]

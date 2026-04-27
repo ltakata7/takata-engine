@@ -279,10 +279,19 @@ class MultiTimeframeManager:
         Returns
         -------
         str or None
-            ``"3m"``, ``"5m"``, ``"15m"``, or None (no trade).
+            ``"1m"``, ``"3m"``, ``"5m"``, ``"15m"``, or None (no trade).
+
+        Tiering (from fast to slow):
+            adx > 50                              → "1m"  (very strong trend, scalp)
+            high_vol_choppy or adx > 35           → "3m"  (active range/breakout)
+            low_vol_trending and adx < 20         → "15m" (slow drift)
+            otherwise                             → "5m"  (default)
+            crisis                                → None  (no trade)
         """
         if regime == "crisis":
             return None
+        elif adx_value > 50:
+            return "1m"
         elif regime == "high_vol_choppy" or adx_value > 35:
             return "3m"
         elif regime == "low_vol_trending" and adx_value < 20:

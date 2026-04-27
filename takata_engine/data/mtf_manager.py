@@ -1,6 +1,8 @@
 """Multi-Timeframe Data Manager — fetches and maintains bar data across timeframes.
 
 Top-down analysis: daily/60m for bias, 15m for confirmation, 5m for entry precision.
+Fast/scalp timeframes (3m / 1m / 30s) are also fetched for high-frequency setups
+like 1-min EMA pullbacks, 30s VWAP rejections, and ORB micro-breaks.
 """
 
 from __future__ import annotations
@@ -22,17 +24,26 @@ from takata_engine.technical.trend import classify_trend
 
 logger = logging.getLogger(__name__)
 
-# IBKR fetch specs per timeframe
+# IBKR fetch specs per timeframe. Slow timeframes (daily/60m/15m/5m) drive bias,
+# confirmation, and standard entries. Fast timeframes (3m/1m/30s) drive scalp
+# setups. Adding 3m here also fixes a latent bug: select_entry_timeframe()
+# could return "3m" for high-vol regimes but no spec existed.
 TIMEFRAME_SPECS = {
     "daily": {"duration": "20 D", "bar_size": "1 day", "min_bars": 20},
     "60m":   {"duration": "5 D",  "bar_size": "1 hour", "min_bars": 30},
     "15m":   {"duration": "3 D",  "bar_size": "15 mins", "min_bars": 50},
     "5m":    {"duration": "2 D",  "bar_size": "5 mins", "min_bars": 100},
+    "3m":    {"duration": "1 D",  "bar_size": "3 mins", "min_bars": 80},
+    "1m":    {"duration": "1 D",  "bar_size": "1 min",  "min_bars": 200},
+    "30s":   {"duration": "1 D",  "bar_size": "30 secs", "min_bars": 200},
 }
 
 FAST_UPDATE_SPECS = {
     "5m":  {"duration": "900 S",  "bar_size": "5 mins"},
     "15m": {"duration": "3600 S", "bar_size": "15 mins"},
+    "3m":  {"duration": "1800 S", "bar_size": "3 mins"},
+    "1m":  {"duration": "600 S",  "bar_size": "1 min"},
+    "30s": {"duration": "300 S",  "bar_size": "30 secs"},
 }
 
 BIAS_LABELS = {

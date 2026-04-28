@@ -495,6 +495,7 @@ class MESAutotrader:
         entry = pos["entry_price"]
         target = pos.get("target", 0)
         current_stop = pos.get("current_stop", pos.get("stop", 0))
+        original_stop = current_stop  # for IBKR modify diff
 
         # Use ATR from signal-time as fallback when caller doesn't pass one.
         atr_used = float(atr) if atr is not None else float(pos.get("atr_at_entry", 0) or 0)
@@ -547,11 +548,40 @@ class MESAutotrader:
                     pos["current_stop"] = trailing
                     current_stop = trailing
 
-        # 4. Stop-out detection. In paper mode we simulate the exit so
-        #    the trail/BE actually closes the trade. In live mode the
-        #    real IBKR bracket stop hasn't been modified (executor lacks
-        #    the API), so the original broker stop will fire — we only
-        #    log the divergence for audit.
+        # 4. If stop changed (BE move or trail step), modify the IBKR
+        #    stop order in live mode so the real broker stop tracks the
+        #    managed one. Bracket order convention from submit_bracket_order:
+        #    order_ids[0]=parent (entry), [1]=takeProfit, [2]=stopLoss.
+        if not self.config.paper and current_stop != original_stop:
+            stop_order_id = None
+            order_ids = pos.get("order_ids") or []
+            if len(order_ids) >= 3:
+                stop_order_id = order_ids[2]
+            if stop_order_id:
+                try:
+                    executor = self._get_executor()
+                    if hasattr(executor, "modify_order_price"):
+                        executor.modify_order_price(stop_order_id, new_aux_price=current_stop)
+                        logger.info(
+                            "AUTOTRADER MGMT (LIVE): stop modified at IBKR orderId=%d → %.2f",
+                            stop_order_id, current_stop,
+                        )
+                    else:
+                        logger.warning(
+                            "AUTOTRADER MGMT (LIVE): executor lacks modify_order_price — "
+                            "stop %.2f → %.2f not pushed to broker",
+                            original_stop, current_stop,
+                        )
+                except Exception as e:
+                    logger.error(
+                        "AUTOTRADER MGMT (LIVE): modify failed orderId=%s: %s",
+                        stop_order_id, e,
+                    )
+
+        # 5. Stop-out detection. In paper mode we simulate the exit so the
+        #    trail/BE actually closes the trade. In live mode IBKR's modified
+        #    stop will fire on its own — we just record the close when
+        #    record_fill is invoked by the broker fill (via check_position).
         stopped = (direction == "long" and current_price <= current_stop) or \
                   (direction == "short" and current_price >= current_stop)
         if stopped:
@@ -563,16 +593,8 @@ class MESAutotrader:
                     current_stop, exit_reason,
                 )
                 return self.record_fill(current_stop, exit_reason)
-            else:
-                # Live mode: only log the divergence, don't double-fill.
-                if not pos.get("live_management_warned"):
-                    logger.warning(
-                        "AUTOTRADER MGMT (LIVE): managed stop %.2f hit but IBKR "
-                        "order still at %.2f — consider manual close. (executor "
-                        "lacks modify_order; live order management not wired yet)",
-                        current_stop, pos.get("stop", 0),
-                    )
-                    pos["live_management_warned"] = True
+            # Live: IBKR will handle the fill via the modified stop order.
+            # check_position polling will pick up the fill in record_fill.
 
         # Persist state mutations so next call/process sees them.
         self.state.save()

@@ -178,6 +178,72 @@ class IBKRExecutor:
             target_price=signal.target,
         )
 
+    def modify_order_price(
+        self,
+        order_id: int,
+        new_aux_price: Optional[float] = None,
+        new_lmt_price: Optional[float] = None,
+    ) -> Optional[OrderResult]:
+        """Modify the price of an existing order.
+
+        Used by the autotrader's update_position_state to mutate stop/target
+        levels in live mode (trailing stop, breakeven-after-T1). For STP
+        orders the relevant field is auxPrice; for LMT orders it's lmtPrice.
+        Both can be passed; only the matching field for the order's type
+        is used.
+
+        Modifying via ib_insync is done by re-calling placeOrder with the
+        SAME orderId — the gateway treats it as a modify rather than a new
+        order. Returns the updated OrderResult or None if not found.
+
+        Parameters
+        ----------
+        order_id : int
+            The IBKR order ID to modify.
+        new_aux_price : float, optional
+            New stop price (for STP orders).
+        new_lmt_price : float, optional
+            New limit price (for LMT orders).
+        """
+        target_trade = None
+        for trade in self.ib.openTrades():
+            if trade.order.orderId == order_id:
+                target_trade = trade
+                break
+        if target_trade is None:
+            logger.warning("modify_order_price: orderId=%d not found in openTrades", order_id)
+            return None
+
+        order = target_trade.order
+        old_aux = getattr(order, "auxPrice", None)
+        old_lmt = getattr(order, "lmtPrice", None)
+        if new_aux_price is not None and order.orderType in ("STP", "STP LMT"):
+            order.auxPrice = new_aux_price
+        if new_lmt_price is not None and order.orderType in ("LMT", "STP LMT"):
+            order.lmtPrice = new_lmt_price
+
+        # Re-place to apply modification (same orderId triggers modify path).
+        new_trade = self.ib.placeOrder(target_trade.contract, order)
+        logger.info(
+            "MODIFY orderId=%d type=%s aux=%s→%s lmt=%s→%s",
+            order_id, order.orderType, old_aux, new_aux_price, old_lmt, new_lmt_price,
+        )
+        return self._trade_to_result(
+            new_trade,
+            target_trade.contract.symbol,
+            "long" if order.action == "BUY" else "short",
+            order.orderType,
+        )
+
+    def cancel_order(self, order_id: int) -> bool:
+        """Cancel a single order by ID. Returns True if found and cancelled."""
+        for trade in self.ib.openTrades():
+            if trade.order.orderId == order_id:
+                self.ib.cancelOrder(trade.order)
+                logger.info("Cancelled order %d", order_id)
+                return True
+        return False
+
     def cancel_all(self, instrument: Optional[str] = None) -> int:
         """Cancel all open orders, optionally filtered by instrument."""
         cancelled = 0

@@ -68,8 +68,16 @@ class AutotraderConfig:
 
     # Execution
     use_market_entry: bool = True            # True=market, False=limit at signal price
-    breakeven_after_t1: bool = True          # move stop to BE after T1 hit
-    trail_stop: bool = False                 # trailing stop (not yet implemented)
+    breakeven_after_t1: bool = True          # move stop to BE once price touches T1
+    trail_stop: bool = True                  # trail stop after T1 by trail_atr_mult * ATR
+    trail_atr_mult: float = 1.5              # trailing distance in ATR units
+
+    # End-of-day sizing taper — reduce contracts late in BRT session
+    # to avoid swing-by-mistake exposure on positions still open near close.
+    # Trades after this hour use eod_taper_factor of base sizing.
+    eod_size_taper: bool = True
+    eod_taper_brt_hour: int = 17             # start tapering at 17:00 BRT
+    eod_taper_factor: float = 0.5            # multiply contracts by this
 
     def save(self):
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -314,6 +322,23 @@ class MESAutotrader:
                 contracts = max(1, int(contracts * mult))
         contracts = min(contracts, self.config.max_contracts)
 
+        # EOD sizing taper: positions opened late in BRT session get smaller
+        # to avoid carrying size through close noise / unintentional swing.
+        if self.config.eod_size_taper:
+            try:
+                import pytz
+                brt_hour = datetime.now(pytz.timezone("America/Sao_Paulo")).hour
+                if brt_hour >= self.config.eod_taper_brt_hour:
+                    eod_contracts = max(1, int(contracts * self.config.eod_taper_factor))
+                    if eod_contracts < contracts:
+                        logger.info(
+                            "AUTOTRADER EOD taper: %d → %d contracts (BRT %dh ≥ %dh)",
+                            contracts, eod_contracts, brt_hour, self.config.eod_taper_brt_hour,
+                        )
+                        contracts = eod_contracts
+            except Exception as e:
+                logger.debug("EOD taper failed: %s", e)
+
         # Tick-align MES prices to 0.25
         stop = round(stop * 4) / 4
         target = round(target * 4) / 4
@@ -365,14 +390,25 @@ class MESAutotrader:
                 order_ids=order_ids,
             )
 
-            # Update state
+            # Update state — enriched with management fields used by
+            # update_position_state for breakeven-after-T1 + trailing stop.
+            # Paper mode actively simulates fills against current_stop;
+            # live mode currently only logs when management WOULD move
+            # the stop (executor lacks modify_order — see TODO at top).
             self.state.trades_today += 1
             self.state.last_trade_ts = time.time()
             self.state.open_position = {
                 "direction": direction,
                 "entry_price": price,
-                "stop": stop,
-                "target": target,
+                "stop": stop,                  # original IBKR stop (unchanged)
+                "target": target,              # T1 (the IBKR take-profit leg)
+                "current_stop": stop,          # mutates over time via management
+                "high_water_mark": price,      # max favorable excursion (long)
+                "low_water_mark": price,       # min favorable excursion (short)
+                "atr_at_entry": float(signal.get("atr", 0) or 0),
+                "t1_hit": False,
+                "be_moved": False,
+                "trail_active": False,
                 "contracts": contracts,
                 "order_ids": order_ids,
                 "opened_at": datetime.utcnow().isoformat(),
@@ -426,6 +462,120 @@ class MESAutotrader:
         except Exception as e:
             logger.debug("Position check failed: %s", e)
 
+        return None
+
+    def update_position_state(self, current_price: float, atr: Optional[float] = None) -> Optional[Dict]:
+        """Active position management — called every scan cycle.
+
+        Implements breakeven-after-T1 and trailing-stop algorithms by
+        mutating ``state.open_position["current_stop"]``.
+
+        Behavior:
+          * Track high/low water mark for trailing.
+          * On first touch of T1 (target_price), flip ``t1_hit`` and
+            move ``current_stop`` to entry (if breakeven_after_t1).
+          * After T1, trail ``current_stop`` to
+            ``high_water_mark - trail_atr_mult * atr`` for long
+            (and symmetric for short), never moving against the trade.
+          * In paper mode, simulate the fill when current_price crosses
+            current_stop in the adverse direction — this is what makes
+            paper mode meaningful while live IBKR order modification
+            isn't yet wired into the executor.
+          * In live mode, log the would-be stop change but don't
+            mutate the actual broker order yet (TODO: add
+            ``modify_order`` to ``IBKRExecutor`` and wire it here).
+
+        Returns the trade record if a fill was simulated, else None.
+        """
+        if not self.state.open_position:
+            return None
+
+        pos = self.state.open_position
+        direction = pos["direction"]
+        entry = pos["entry_price"]
+        target = pos.get("target", 0)
+        current_stop = pos.get("current_stop", pos.get("stop", 0))
+
+        # Use ATR from signal-time as fallback when caller doesn't pass one.
+        atr_used = float(atr) if atr is not None else float(pos.get("atr_at_entry", 0) or 0)
+
+        # 1. Update water marks
+        if direction == "long":
+            pos["high_water_mark"] = max(pos.get("high_water_mark", entry), current_price)
+        else:
+            pos["low_water_mark"] = min(pos.get("low_water_mark", entry), current_price)
+
+        # 2. Detect T1 hit (first time only) and move stop to BE.
+        if not pos.get("t1_hit") and target:
+            t1_hit = (direction == "long" and current_price >= target) or \
+                     (direction == "short" and current_price <= target)
+            if t1_hit:
+                pos["t1_hit"] = True
+                if self.config.breakeven_after_t1 and not pos.get("be_moved"):
+                    new_stop = entry
+                    if (direction == "long" and new_stop > current_stop) or \
+                       (direction == "short" and new_stop < current_stop):
+                        logger.info(
+                            "AUTOTRADER MGMT: T1 hit @ %.2f, stop %.2f → BE %.2f (%s)",
+                            current_price, current_stop, new_stop,
+                            "PAPER" if self.config.paper else "LIVE log-only",
+                        )
+                        pos["current_stop"] = new_stop
+                        pos["be_moved"] = True
+                        current_stop = new_stop
+
+        # 3. Trail after T1 hit, using ATR-based distance.
+        if pos.get("t1_hit") and self.config.trail_stop and atr_used > 0:
+            trail_dist = self.config.trail_atr_mult * atr_used
+            if direction == "long":
+                trailing = pos["high_water_mark"] - trail_dist
+                # Tick-align to MES 0.25
+                trailing = round(trailing * 4) / 4
+                if trailing > current_stop:
+                    if not pos.get("trail_active"):
+                        pos["trail_active"] = True
+                        logger.info("AUTOTRADER MGMT: trailing stop active (long)")
+                    pos["current_stop"] = trailing
+                    current_stop = trailing
+            else:
+                trailing = pos["low_water_mark"] + trail_dist
+                trailing = round(trailing * 4) / 4
+                if trailing < current_stop:
+                    if not pos.get("trail_active"):
+                        pos["trail_active"] = True
+                        logger.info("AUTOTRADER MGMT: trailing stop active (short)")
+                    pos["current_stop"] = trailing
+                    current_stop = trailing
+
+        # 4. Stop-out detection. In paper mode we simulate the exit so
+        #    the trail/BE actually closes the trade. In live mode the
+        #    real IBKR bracket stop hasn't been modified (executor lacks
+        #    the API), so the original broker stop will fire — we only
+        #    log the divergence for audit.
+        stopped = (direction == "long" and current_price <= current_stop) or \
+                  (direction == "short" and current_price >= current_stop)
+        if stopped:
+            if self.config.paper:
+                exit_reason = "trail_stop" if pos.get("trail_active") else \
+                              "breakeven" if pos.get("be_moved") else "initial_stop"
+                logger.info(
+                    "AUTOTRADER MGMT: paper-fill simulated @ %.2f (reason=%s)",
+                    current_stop, exit_reason,
+                )
+                return self.record_fill(current_stop, exit_reason)
+            else:
+                # Live mode: only log the divergence, don't double-fill.
+                if not pos.get("live_management_warned"):
+                    logger.warning(
+                        "AUTOTRADER MGMT (LIVE): managed stop %.2f hit but IBKR "
+                        "order still at %.2f — consider manual close. (executor "
+                        "lacks modify_order; live order management not wired yet)",
+                        current_stop, pos.get("stop", 0),
+                    )
+                    pos["live_management_warned"] = True
+
+        # Persist state mutations so next call/process sees them.
+        self.state.save()
         return None
 
     def record_fill(self, exit_price: float, exit_reason: str = "bracket"):

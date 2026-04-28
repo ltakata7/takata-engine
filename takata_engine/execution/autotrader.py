@@ -79,6 +79,17 @@ class AutotraderConfig:
     eod_taper_brt_hour: int = 17             # start tapering at 17:00 BRT
     eod_taper_factor: float = 0.5            # multiply contracts by this
 
+    # Multi-target scale-out: at T1, peel off this fraction of the
+    # position at the take-profit price, leaving the rest as a "runner"
+    # that the trailing stop manages toward T2 / further. PF lever:
+    # locks in profit on half, lets the rest run — directly addresses
+    # the "winners cap at T1, then revert" pattern. Active in paper
+    # mode (simulated partial fill); live mode requires modifying the
+    # IBKR takeProfit qty + submitting a new TP order for the runner —
+    # not yet wired here, only paper-mode behavior is implemented.
+    scale_out_at_t1: bool = True
+    scale_out_pct: float = 0.5               # fraction to close at T1
+
     def save(self):
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         CONFIG_PATH.write_text(json.dumps(asdict(self), indent=2))
@@ -506,12 +517,24 @@ class MESAutotrader:
         else:
             pos["low_water_mark"] = min(pos.get("low_water_mark", entry), current_price)
 
-        # 2. Detect T1 hit (first time only) and move stop to BE.
+        # 2. Detect T1 hit (first time only). Three things may happen:
+        #    a) scale-out 50% of the runner at T1 (paper mode)
+        #    b) move stop to BE
+        #    c) flip t1_hit so subsequent ticks run the trail logic
         if not pos.get("t1_hit") and target:
             t1_hit = (direction == "long" and current_price >= target) or \
                      (direction == "short" and current_price <= target)
             if t1_hit:
                 pos["t1_hit"] = True
+                # 2a. Scale-out — peel half off at T1 in paper mode.
+                # In live mode, modifying the IBKR takeProfit qty + submitting
+                # a new TP for the runner isn't wired yet; we leave the broker
+                # bracket alone and only the BE/trail moves apply.
+                if (self.config.scale_out_at_t1 and self.config.paper
+                        and not pos.get("scaled_out") and pos.get("contracts", 0) > 1):
+                    scale_qty = max(1, int(round(pos["contracts"] * self.config.scale_out_pct)))
+                    if scale_qty < pos["contracts"]:
+                        self._record_partial_fill(target, scale_qty, "scale_out_t1")
                 if self.config.breakeven_after_t1 and not pos.get("be_moved"):
                     new_stop = entry
                     if (direction == "long" and new_stop > current_stop) or \
@@ -519,7 +542,7 @@ class MESAutotrader:
                         logger.info(
                             "AUTOTRADER MGMT: T1 hit @ %.2f, stop %.2f → BE %.2f (%s)",
                             current_price, current_stop, new_stop,
-                            "PAPER" if self.config.paper else "LIVE log-only",
+                            "PAPER" if self.config.paper else "LIVE",
                         )
                         pos["current_stop"] = new_stop
                         pos["be_moved"] = True
@@ -599,6 +622,56 @@ class MESAutotrader:
         # Persist state mutations so next call/process sees them.
         self.state.save()
         return None
+
+    def _record_partial_fill(self, scale_price: float, scale_contracts: int, reason: str) -> None:
+        """Record a partial close (scale-out at T1).
+
+        Closes ``scale_contracts`` of the open position at ``scale_price``
+        and reduces ``state.open_position.contracts`` to the remaining
+        runner qty. Adds a `partial=True` entry to trade_log so the
+        attribution dashboard / P&L view can split the position into
+        scale-out leg and runner leg.
+
+        Wins/losses counters are NOT touched here — partial fills are
+        intermediate; the trade outcome is decided when the runner
+        finally closes via stop or target. Daily P&L IS updated since
+        the partial fill realized cash.
+        """
+        if not self.state.open_position:
+            return
+        pos = self.state.open_position
+        direction = pos["direction"]
+        entry = pos["entry_price"]
+
+        if direction == "long":
+            pnl_pts = scale_price - entry
+        else:
+            pnl_pts = entry - scale_price
+        pnl_usd = pnl_pts * 5.0 * scale_contracts
+
+        self.state.daily_pnl_usd += pnl_usd
+        self.state.trade_log.append({
+            "direction": direction,
+            "entry_price": entry,
+            "exit_price": scale_price,
+            "exit_reason": reason,
+            "contracts": scale_contracts,
+            "pnl_pts": round(pnl_pts, 2),
+            "pnl_usd": round(pnl_usd, 2),
+            "closed_at": datetime.utcnow().isoformat(),
+            "partial": True,
+            "remaining_contracts": pos["contracts"] - scale_contracts,
+            "signal_strength": pos.get("signal_strength"),
+            "reasons": pos.get("reasons", []),
+        })
+        pos["contracts"] -= scale_contracts
+        pos["scaled_out"] = True
+
+        logger.info(
+            "AUTOTRADER MGMT: scale-out %d → %.2f (PnL=$%.2f) | runner %d remains",
+            scale_contracts, scale_price, pnl_usd, pos["contracts"],
+        )
+        self.state.save()
 
     def record_fill(self, exit_price: float, exit_reason: str = "bracket"):
         """Manually record a position close (called when fill detected)."""

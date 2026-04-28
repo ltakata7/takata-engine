@@ -5,4 +5,4 @@ signal generation, ML framework, macro data feeds, research, screening, technica
 analysis, sector rotation, portfolio construction, risk models, and Claude agents.
 """
 
-__version__ = "0.1.10"
+__version__ = "0.1.11"

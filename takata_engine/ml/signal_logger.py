@@ -71,6 +71,190 @@ class LiveSignalLogger:
         self.outcome_log = self.log_dir / "signal_outcomes.jsonl"
         self._pending: Dict[str, Dict[str, Any]] = {}  # signals awaiting outcome
 
+    @staticmethod
+    def _extract_ml_features(
+        signal: Dict[str, Any],
+        indicators: Dict[str, Any],
+        day_trade_ta: Optional[Dict[str, Any]] = None,
+        confluence: Optional[Dict[str, Any]] = None,
+        chop_regime: Optional[Dict[str, Any]] = None,
+        absorption: Optional[Dict[str, Any]] = None,
+        agg_streak: Optional[Dict[str, Any]] = None,
+        dom: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, float]:
+        """Build the ML feature vector. All values are numeric and bounded so
+        the model isn't forced to learn weird scales. Distances are normalized
+        by ATR; categorical fields are one-hot; missing fields default to 0
+        (neutral).
+        """
+        close = float(indicators.get("close", 0) or 0)
+        atr = float(indicators.get("atr", 0) or 0)
+        atr_safe = atr if atr > 0 else 1.0
+
+        feats: Dict[str, float] = {
+            # ── Classic indicators ──
+            "ema_spread": float(indicators.get("ema_fast", 0) or 0) - float(indicators.get("ema_slow", 0) or 0),
+            "rsi": float(indicators.get("rsi", 0) or 0),
+            "adx": float(indicators.get("adx", 0) or 0),
+            "macd_hist": float(indicators.get("macd_hist", 0) or 0),
+            "atr": atr,
+            "vwap_distance": close - float(indicators.get("vwap", 0) or 0),
+            "close": close,
+            "aggression": float(indicators.get("aggression", 0) or 0),
+            # ── Microstructure — Phase A (position/flow) ──
+            "orb_distance_15": float(indicators.get("orb_distance_15", 0) or 0),
+            "orb_range_15": float(indicators.get("orb_range_15", 0) or 0),
+            "orb_broke_dir": float(indicators.get("orb_broke_dir", 0) or 0),
+            "vwap_sigma_distance": float(indicators.get("vwap_sigma_distance", 0) or 0),
+            "cum_delta": float(indicators.get("cum_delta", 0) or 0),
+            "delta_change": float(indicators.get("delta_change", 0) or 0),
+            # ── Microstructure — Phase B (liquidity/activity) ──
+            "rv_iv_ratio_5m": float(indicators.get("rv_iv_ratio_5m", 0) or 0),
+            "spread_percentile": float(indicators.get("spread_percentile", 0) or 0),
+            "spread_z_score": float(indicators.get("spread_z_score", 0) or 0),
+            "vol_burst_ratio": float(indicators.get("vol_burst_ratio", 0) or 0),
+            # ── Microstructure — Phase C (inter-market) ──
+            "xcorr_ind": float(indicators.get("xcorr_ind", 0) or 0),
+            "xcorr_es": float(indicators.get("xcorr_es", 0) or 0),
+            "leadlag_best_corr": float(indicators.get("leadlag_best_corr", 0) or 0),
+            "leadlag_best_lag": float(indicators.get("leadlag_best_lag", 0) or 0),
+            "risk_regime_score": float(indicators.get("risk_regime_score", 0) or 0),
+            # ── Statistical / multifractal — Phase D ──
+            "hurst_50": float(indicators.get("hurst_50", 0.5) or 0.5),
+            "return_skew_30": float(indicators.get("return_skew_30", 0) or 0),
+            "return_kurt_30": float(indicators.get("return_kurt_30", 0) or 0),
+        }
+
+        # ── Phase 2 — Volume Profile + Anchored VWAP + Opening Range ──
+        # Distances are normalized by ATR for scale invariance.
+        # Defaults: 0 = neutral (no distance / no anchor / no value area).
+        vp = (day_trade_ta or {}).get("volume_profile") or {}
+        avwap = (day_trade_ta or {}).get("anchored_vwap") or {}
+        or_ = (day_trade_ta or {}).get("opening_range") or {}
+
+        poc = vp.get("poc")
+        vah = vp.get("vah")
+        val = vp.get("val")
+        feats["poc_distance_atr"] = (close - poc) / atr_safe if poc and close > 0 else 0.0
+        feats["vah_distance_atr"] = (close - vah) / atr_safe if vah and close > 0 else 0.0
+        feats["val_distance_atr"] = (close - val) / atr_safe if val and close > 0 else 0.0
+        # Position relative to value area: 1=above VAH, -1=below VAL, 0=inside.
+        if vah and val and close:
+            if close > vah:
+                feats["va_position"] = 1.0
+            elif close < val:
+                feats["va_position"] = -1.0
+            else:
+                feats["va_position"] = 0.0
+        else:
+            feats["va_position"] = 0.0
+
+        avwap_session = avwap.get("session_open")
+        avwap_pdh = avwap.get("prior_high")
+        avwap_pdl = avwap.get("prior_low")
+        feats["avwap_session_distance_atr"] = (close - avwap_session) / atr_safe if avwap_session and close > 0 else 0.0
+        feats["avwap_prior_high_distance_atr"] = (close - avwap_pdh) / atr_safe if avwap_pdh and close > 0 else 0.0
+        feats["avwap_prior_low_distance_atr"] = (close - avwap_pdl) / atr_safe if avwap_pdl and close > 0 else 0.0
+
+        or_state = or_.get("state", "")
+        feats["or_state_above"] = 1.0 if or_state == "above" else 0.0
+        feats["or_state_below"] = 1.0 if or_state == "below" else 0.0
+        feats["or_state_inside"] = 1.0 if or_state == "inside" else 0.0
+        or_width = or_.get("width", 0) or 0
+        feats["or_width_atr"] = or_width / atr_safe if or_width else 0.0
+        feats["or_locked"] = 1.0 if or_.get("is_locked") else 0.0
+
+        # ── Phase 3 — Cross-asset confluence ──
+        c = confluence or {}
+        feats["cross_asset_score"] = float(c.get("score", 50))   # 50 = neutral
+        feats["cross_asset_agreed_count"] = float(len(c.get("agreed", []) or []))
+        feats["cross_asset_disagreed_count"] = float(len(c.get("disagreed", []) or []))
+
+        # ── Phase 4 — Mean reversion ──
+        cr = chop_regime or {}
+        feats["chop_score"] = float(cr.get("score", 0))           # 0 = trending
+        feats["chop_adx"] = float(cr.get("adx", 0) or 0)
+        feats["chop_bb_width_pct"] = float(cr.get("bb_width_pct", 50) or 50)
+        feats["chop_vwap_displacement"] = float(cr.get("vwap_displacement", 0) or 0)
+
+        mode = signal.get("mode", "trend")
+        feats["is_mean_reversion"] = 1.0 if mode == "mean_reversion" else 0.0
+        setup_type = signal.get("setup_type") or ""
+        feats["mr_setup_vwap_fade"] = 1.0 if setup_type == "vwap_fade" else 0.0
+        feats["mr_setup_bbands_extreme"] = 1.0 if setup_type == "bbands_extreme" else 0.0
+        feats["mr_setup_poc_reclaim"] = 1.0 if setup_type == "poc_reclaim" else 0.0
+
+        # ── Phase 6 — tape depth: absorption + aggression streak ──
+        ab = absorption or {}
+        feats["absorption_active"] = 1.0 if ab.get("active") else 0.0
+        # Direction: +1 bull, -1 bear, 0 neutral/none
+        ab_dir = ab.get("direction", "none")
+        feats["absorption_dir"] = 1.0 if ab_dir == "bull" else (-1.0 if ab_dir == "bear" else 0.0)
+        feats["absorption_volume_z"] = float(ab.get("volume_z", 0) or 0)
+        feats["absorption_range_z"] = float(ab.get("range_z", 0) or 0)
+
+        ags = agg_streak or {}
+        feats["agg_streak_active"] = 1.0 if ags.get("active") else 0.0
+        ags_dir = ags.get("direction", "neutral")
+        feats["agg_streak_dir"] = 1.0 if ags_dir == "bull" else (-1.0 if ags_dir == "bear" else 0.0)
+        feats["agg_streak_length"] = float(ags.get("length", 0) or 0)
+        feats["agg_streak_cumulative"] = float(ags.get("cumulative_agg", 0) or 0)
+        feats["agg_exhaustion_active"] = 1.0 if ags.get("exhaustion_active") else 0.0
+
+        # ── Phase 8 — DOM imbalance (Level 2 ladder) ──
+        d = dom or {}
+        feats["dom_active"] = 1.0 if d.get("active") else 0.0
+        d_dir = d.get("direction", "none")
+        feats["dom_dir"] = 1.0 if d_dir == "bull" else (-1.0 if d_dir == "bear" else 0.0)
+        feats["dom_persistence"] = float(d.get("persistence", 0) or 0)
+        feats["dom_ratio_bid_over_ask"] = float(d.get("ratio_bid_over_ask", 0) or 0)
+        feats["dom_thin"] = 1.0 if d.get("thin") else 0.0
+
+        return feats
+
+    @staticmethod
+    def feature_columns() -> List[str]:
+        """Canonical ordered list of ML feature names. The retrain endpoint
+        and the live ML filter must use the same list so feature_names_in_
+        matches at predict time."""
+        return [
+            # Classic
+            "ema_spread", "rsi", "adx", "macd_hist", "atr", "vwap_distance",
+            "aggression",
+            # Phase A
+            "orb_distance_15", "orb_range_15", "orb_broke_dir",
+            "vwap_sigma_distance", "cum_delta", "delta_change",
+            # Phase B
+            "rv_iv_ratio_5m", "spread_percentile", "spread_z_score", "vol_burst_ratio",
+            # Phase C
+            "xcorr_ind", "xcorr_es", "leadlag_best_corr", "leadlag_best_lag",
+            "risk_regime_score",
+            # Phase D
+            "hurst_50", "return_skew_30", "return_kurt_30",
+            # Phase 2 — Volume Profile / Anchored VWAP / Opening Range
+            "poc_distance_atr", "vah_distance_atr", "val_distance_atr",
+            "va_position",
+            "avwap_session_distance_atr",
+            "avwap_prior_high_distance_atr", "avwap_prior_low_distance_atr",
+            "or_state_above", "or_state_below", "or_state_inside",
+            "or_width_atr", "or_locked",
+            # Phase 3 — Cross-asset confluence
+            "cross_asset_score", "cross_asset_agreed_count", "cross_asset_disagreed_count",
+            # Phase 4 — Chop / mean reversion
+            "chop_score", "chop_adx", "chop_bb_width_pct", "chop_vwap_displacement",
+            "is_mean_reversion",
+            "mr_setup_vwap_fade", "mr_setup_bbands_extreme", "mr_setup_poc_reclaim",
+            # Phase 6 — Tape depth (absorption + aggression streak)
+            "absorption_active", "absorption_dir",
+            "absorption_volume_z", "absorption_range_z",
+            "agg_streak_active", "agg_streak_dir",
+            "agg_streak_length", "agg_streak_cumulative",
+            "agg_exhaustion_active",
+            # Phase 8 — DOM imbalance (Level 2 ladder)
+            "dom_active", "dom_dir", "dom_persistence",
+            "dom_ratio_bid_over_ask", "dom_thin",
+        ]
+
     def log_signal(
         self,
         instrument: str,
@@ -81,9 +265,33 @@ class LiveSignalLogger:
         session_phase: str = "",
         entry_timeframe: str = "5m",
         trends: Optional[Dict[str, str]] = None,
+        day_trade_ta: Optional[Dict[str, Any]] = None,
+        confluence: Optional[Dict[str, Any]] = None,
+        chop_regime: Optional[Dict[str, Any]] = None,
+        absorption: Optional[Dict[str, Any]] = None,
+        agg_streak: Optional[Dict[str, Any]] = None,
+        dom: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """Log a new signal. Returns a signal_id for outcome tracking."""
+        """Log a new signal. Returns a signal_id for outcome tracking.
+
+        New (Phase 2-4) optional context:
+            day_trade_ta: from `_compute_day_trade_ta` — Volume Profile +
+                Anchored VWAP + Opening Range. Distances are derived as
+                multiples of ATR so they're scale-invariant across instruments.
+            confluence: cross_asset_confluence().to_dict() — score 0-100,
+                agreed/disagreed/missing peer lists.
+            chop_regime: detect_chop().to_dict() — populated when MR fallback
+                ran (chop detected). None or score=0 = trending market.
+
+        signal["mode"] ("trend" | "mean_reversion") + signal["setup_type"]
+        (when MR) are read directly off the signal dict.
+        """
         signal_id = f"{instrument}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+
+        ml_features = self._extract_ml_features(
+            signal, indicators, day_trade_ta, confluence, chop_regime,
+            absorption, agg_streak, dom,
+        )
 
         record = {
             "signal_id": signal_id,
@@ -100,48 +308,22 @@ class LiveSignalLogger:
             "session_phase": session_phase,
             "entry_timeframe": entry_timeframe,
             "trends": trends or {},
-            # Indicator snapshot — the ML features
-            "indicators": {
-                # Classic indicators
-                "ema_spread": indicators.get("ema_fast", 0) - indicators.get("ema_slow", 0),
-                "rsi": indicators.get("rsi", 0),
-                "adx": indicators.get("adx", 0),
-                "macd_hist": indicators.get("macd_hist", 0),
-                "atr": indicators.get("atr", 0),
-                "vwap_distance": indicators.get("close", 0) - indicators.get("vwap", 0),
-                "close": indicators.get("close", 0),
-                "aggression": indicators.get("aggression", 0),
-                # Microstructure — Phase A (position/flow)
-                "orb_distance_15": indicators.get("orb_distance_15", 0),
-                "orb_range_15": indicators.get("orb_range_15", 0),
-                "orb_broke_dir": indicators.get("orb_broke_dir", 0),
-                "vwap_sigma_distance": indicators.get("vwap_sigma_distance", 0),
-                "cum_delta": indicators.get("cum_delta", 0),
-                "delta_change": indicators.get("delta_change", 0),
-                # Microstructure — Phase B (liquidity/activity)
-                "rv_iv_ratio_5m": indicators.get("rv_iv_ratio_5m", 0),
-                "spread_percentile": indicators.get("spread_percentile", 0),
-                "spread_z_score": indicators.get("spread_z_score", 0),
-                "vol_burst_ratio": indicators.get("vol_burst_ratio", 0),
-                # Microstructure — Phase C (inter-market)
-                "xcorr_ind": indicators.get("xcorr_ind", 0),
-                "xcorr_es": indicators.get("xcorr_es", 0),
-                "leadlag_best_corr": indicators.get("leadlag_best_corr", 0),
-                "leadlag_best_lag": indicators.get("leadlag_best_lag", 0),
-                "risk_regime_score": indicators.get("risk_regime_score", 0),
-                # Statistical / multifractal features (Bloch 2016 §2.1.4–5).
-                # H ≈ 0.5 = random walk; > 0.5 trending; < 0.5 mean-rev.
-                # skew/kurt are over the trailing 30-bar return window.
-                "hurst_50": indicators.get("hurst_50", 0.5),
-                "return_skew_30": indicators.get("return_skew_30", 0.0),
-                "return_kurt_30": indicators.get("return_kurt_30", 0.0),
-            },
+            # Mode tagging — split trend vs MR analytics independently.
+            "mode": signal.get("mode", "trend"),
+            "setup_type": signal.get("setup_type"),  # only set on MR signals
+            # Raw context (for debugging / future feature engineering).
+            "day_trade_ta_raw": day_trade_ta,
+            "confluence_raw": confluence,
+            "chop_regime_raw": chop_regime,
+            # Indicator snapshot — the ML features used for training.
+            # _extract_ml_features() covers Phase A/B/C/D plus Phase 2-8.
+            "indicators": ml_features,
             # Outcome fields — filled later. mfe_pts/mae_pts are
             # populated by check_outcomes() while the signal is
             # pending so timeouts can be classified as
             # timeout_favorable / timeout_adverse.
             "outcome": None,  # "win", "loss", "timeout_favorable",
-                              # "timeout_adverse", "timeout"
+                              # "timeout_adverse", "timeout", "breakeven"
             "mfe_pts": 0.0,
             "mae_pts": 0.0,
             "exit_price": None,
@@ -337,6 +519,9 @@ class LiveSignalLogger:
                                                  / trainable. Tracks
                                                  directional accuracy
                                                  including soft outcomes.
+
+        Also includes a ``by_mode`` split (trend vs mean_reversion) so each
+        signal arm's edge is tracked independently.
         """
         outcomes = self.get_training_data()
 
@@ -351,6 +536,21 @@ class LiveSignalLogger:
         total = len(outcomes)
         strict = wins + losses
         trainable = strict + timeout_favorable + timeout_adverse
+
+        # Split by mode — addresses the user's "split trend vs MR win rate"
+        # ask. Default mode is "trend" for backward-compat with pre-Phase 4 logs.
+        def _mode_stats(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+            n = len(records)
+            w = sum(1 for o in records if o.get("outcome") == "win")
+            l = sum(1 for o in records if o.get("outcome") == "loss")
+            t = sum(1 for o in records if o.get("outcome") == "timeout")
+            return {
+                "total": n, "wins": w, "losses": l, "timeouts": t,
+                "win_rate": round(w / max(n - t, 1) * 100, 1) if n else 0,
+            }
+
+        trend_records = [o for o in outcomes if o.get("mode", "trend") == "trend"]
+        mr_records = [o for o in outcomes if o.get("mode") == "mean_reversion"]
 
         return {
             "log_dir": str(self.log_dir),
@@ -370,4 +570,8 @@ class LiveSignalLogger:
             "avg_bars_to_exit": round(
                 sum(o.get("bars_to_exit", 0) for o in outcomes) / max(total, 1), 1
             ),
+            "by_mode": {
+                "trend": _mode_stats(trend_records),
+                "mean_reversion": _mode_stats(mr_records),
+            },
         }

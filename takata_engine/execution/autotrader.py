@@ -90,6 +90,24 @@ class AutotraderConfig:
     scale_out_at_t1: bool = True
     scale_out_pct: float = 0.5               # fraction to close at T1
 
+    # ── Phase 7 — Dynamic invalidation (cut-when-wrong) ──
+    # All triggers default to OFF for safety. Enable individually via
+    # POST /api/signals/autotrader/config. The bracket stop still protects
+    # the worst-case loss; these triggers cut earlier when the trade
+    # invalidates structurally before the hard stop is reached.
+    invalidation_enabled: bool = False           # master switch
+    # Time-based: no progress for N bars → flatten at market.
+    invalidation_time_enabled: bool = False
+    invalidation_time_bars: int = 4              # how many bars to wait
+    invalidation_time_progress_atr: float = 0.5  # min favorable move (in ATR units)
+    # Structural: price closes back through entry zone (distance from entry
+    # in ATR units, in the wrong direction).
+    invalidation_structural_enabled: bool = False
+    invalidation_structural_atr_threshold: float = 0.6
+    # CVD divergence: long entry, CVD is now negative for M ticks (or vice-versa).
+    invalidation_cvd_enabled: bool = False
+    invalidation_cvd_min_ticks: int = 3
+
     def save(self):
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         CONFIG_PATH.write_text(json.dumps(asdict(self), indent=2))
@@ -423,8 +441,12 @@ class MESAutotrader:
                 "contracts": contracts,
                 "order_ids": order_ids,
                 "opened_at": datetime.utcnow().isoformat(),
+                "opened_at_ts": time.time(),  # for time-based invalidation
                 "signal_strength": signal.get("strength", 0),
                 "reasons": signal.get("reasons", []),
+                # Phase 7 invalidation tracking
+                "best_favorable_pts": 0.0,    # max favorable excursion since entry
+                "cvd_at_entry": None,         # snapshot for divergence check
             }
             self.state.save()
 
@@ -672,6 +694,127 @@ class MESAutotrader:
             scale_contracts, scale_price, pnl_usd, pos["contracts"],
         )
         self.state.save()
+
+    # ── Phase 7 — Dynamic invalidation ──
+
+    def evaluate_invalidation(self, market_state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Evaluate dynamic-stop triggers against the current market state.
+
+        Returns ``None`` if no trigger fires. Returns a result dict
+        ``{"triggered": True, "reason": str, "details": {...}}`` if any
+        enabled trigger fires AND the position is flattened. Each trigger
+        is independently toggleable via ``AutotraderConfig.invalidation_*``.
+        Default-off for safety; the bracket stop is the always-on backstop.
+
+        Expected ``market_state`` keys (any may be missing — tracker
+        callers degrade gracefully):
+            - ``current_price`` (float, required)
+            - ``atr`` (float) — ATR for normalizing the time-progress threshold
+            - ``cum_delta`` (float) — for CVD-divergence trigger
+            - ``ema_fast`` / ``ema_slow`` (float) — for structural reversal
+            - ``bar_now_ts`` (float, optional) — for time-based bar counting
+            - ``bar_count_since_entry`` (int, optional) — fast path
+        """
+        cfg = self.config
+        if not cfg.invalidation_enabled or not self.state.open_position:
+            return None
+        pos = self.state.open_position
+        cur = float(market_state.get("current_price", 0) or 0)
+        if cur <= 0:
+            return None
+        direction = pos["direction"]
+        entry = float(pos.get("entry_price", 0) or 0)
+        if entry <= 0:
+            return None
+        atr = float(market_state.get("atr", 0) or 0)
+
+        # Track best favorable excursion (favorable = move in the trade's direction).
+        favorable_pts = (cur - entry) if direction == "long" else (entry - cur)
+        if favorable_pts > pos.get("best_favorable_pts", 0):
+            pos["best_favorable_pts"] = favorable_pts
+
+        # ── Trigger 1: Time-based no-progress ──
+        if cfg.invalidation_time_enabled:
+            opened_ts = float(pos.get("opened_at_ts", 0) or 0)
+            if opened_ts > 0 and atr > 0:
+                bar_secs = 300  # 5-min bars
+                bars_open = int((time.time() - opened_ts) // bar_secs)
+                if bars_open >= cfg.invalidation_time_bars:
+                    progress_atr = (pos.get("best_favorable_pts", 0)) / atr
+                    if progress_atr < cfg.invalidation_time_progress_atr:
+                        return self._flatten_with_reason(
+                            "invalidation_time",
+                            details={
+                                "bars_open": bars_open,
+                                "progress_atr": round(progress_atr, 2),
+                                "threshold_atr": cfg.invalidation_time_progress_atr,
+                            },
+                        )
+
+        # ── Trigger 2: Structural reversal ──
+        # Price has moved against us by ≥ N ATR from entry — the trade
+        # thesis is no longer holding even though the hard stop hasn't fired.
+        if cfg.invalidation_structural_enabled and atr > 0:
+            adverse_pts = (entry - cur) if direction == "long" else (cur - entry)
+            adverse_atr = adverse_pts / atr if atr > 0 else 0
+            if adverse_atr >= cfg.invalidation_structural_atr_threshold:
+                return self._flatten_with_reason(
+                    "invalidation_structural",
+                    details={
+                        "adverse_atr": round(adverse_atr, 2),
+                        "threshold": cfg.invalidation_structural_atr_threshold,
+                    },
+                )
+
+        # ── Trigger 3: CVD divergence post-entry ──
+        # Snapshot CVD at entry on first call; flatten if it sustains an
+        # opposing direction for N consecutive evaluations.
+        if cfg.invalidation_cvd_enabled:
+            cvd = market_state.get("cum_delta")
+            if cvd is not None:
+                if pos.get("cvd_at_entry") is None:
+                    pos["cvd_at_entry"] = float(cvd)
+                cvd_change = float(cvd) - float(pos["cvd_at_entry"])
+                # Long expects CVD to rise; short expects CVD to fall.
+                cvd_against = (direction == "long" and cvd_change < 0) or \
+                              (direction == "short" and cvd_change > 0)
+                if cvd_against:
+                    pos["cvd_against_count"] = pos.get("cvd_against_count", 0) + 1
+                else:
+                    pos["cvd_against_count"] = 0
+                if pos["cvd_against_count"] >= cfg.invalidation_cvd_min_ticks:
+                    return self._flatten_with_reason(
+                        "invalidation_cvd_divergence",
+                        details={
+                            "cvd_at_entry": pos["cvd_at_entry"],
+                            "cvd_now": cvd,
+                            "against_count": pos["cvd_against_count"],
+                        },
+                    )
+
+        return None
+
+    def _flatten_with_reason(self, reason: str, details: Dict[str, Any]) -> Dict[str, Any]:
+        """Close the open position at market and tag the trade with the reason.
+
+        Returns a dict that the scanner can log + surface in its payload.
+        Failures to flatten (executor down, etc.) are caught — we return the
+        result anyway so the caller knows what was attempted.
+        """
+        pos = dict(self.state.open_position) if self.state.open_position else {}
+        flatten_result = None
+        try:
+            flatten_result = self.flatten()
+            logger.info("AUTOTRADER INVALIDATION: %s — %s", reason, details)
+        except Exception as e:
+            logger.warning("Flatten on invalidation failed (%s): %s", reason, e)
+        return {
+            "triggered": True,
+            "reason": reason,
+            "details": details,
+            "position_at_trigger": pos,
+            "flatten_result": flatten_result,
+        }
 
     def record_fill(self, exit_price: float, exit_reason: str = "bracket"):
         """Manually record a position close (called when fill detected)."""

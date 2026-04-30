@@ -232,13 +232,14 @@ class CumulativeDeltaTracker:
         }
 
 
-# Singleton accessor
-_delta_tracker_instance: Optional[CumulativeDeltaTracker] = None
+# Per-instrument singleton — MES (from IBKR ticks) and WDO (from Profit
+# bridge agg_balance) maintain independent CVD state so they don't contaminate
+# each other.
+_delta_tracker_instances: Dict[str, CumulativeDeltaTracker] = {}
 
 
-def get_delta_tracker() -> CumulativeDeltaTracker:
-    """Get the singleton cumulative delta tracker."""
-    global _delta_tracker_instance
-    if _delta_tracker_instance is None:
-        _delta_tracker_instance = CumulativeDeltaTracker()
-    return _delta_tracker_instance
+def get_delta_tracker(instrument: str = "WDO") -> CumulativeDeltaTracker:
+    """Per-instrument cumulative delta tracker."""
+    if instrument not in _delta_tracker_instances:
+        _delta_tracker_instances[instrument] = CumulativeDeltaTracker()
+    return _delta_tracker_instances[instrument]
